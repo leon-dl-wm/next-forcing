@@ -17,6 +17,7 @@
 7. [关键超参数速查表](#7-关键超参数速查表)
 8. [常见问题与坑（FAQ）](#8-常见问题与坑faq)
 9. [术语表](#9-术语表)
+10. [与上游 LingBot-VA 的 feature 对比](#10-与上游-lingbot-va-的-feature-对比)
 
 ---
 
@@ -656,3 +657,68 @@ pytest tests/ -v      # 纯 CPU, 无需数据/权重
 6. `wan_va/modules/model.py` 的 `FlexAttnFunc._get_mask_mod`（因果掩码，对照论文附录 A 图 5）和 `_forward_mcp`（MCP 前向，对照论文式 7-8）
 7. `wan_va/wan_va_server.py` 的 `_infer / _compute_kv_cache`（推理闭环）
 8. `evaluation/robotwin/eval_policy_client_openpi.py` 的 `eval_policy`（评测协议）
+
+---
+
+## 10. 与上游 LingBot-VA 的 feature 对比
+
+> 对比对象：`lingbot-va`（HEAD `b591d16`；最新代码提交 `7c6ffa9`, 2026-07-10，其后仅文档提交）。
+> 方法：全文件树 diff + 逐文件代码 diff（核心文件变更行数实测）。
+
+### 10.1 两者关系与定位
+
+Next Forcing 是 **LingBot-VA 的研究型 fork**（README 致谢明确说明），论文中 LingBot-VA 即 baseline。实测代码重合度极高：
+
+| 文件 | diff 行数 | 结论 |
+| --- | ---: | --- |
+| `wan_va/utils/scheduler.py` / `utils.py` | 0 | 逐字节相同 |
+| `evaluation/robotwin/calc_stat.py` / `geometry.py` / `msgpack_numpy.py` | 0 | 逐字节相同 |
+| `wan_va/wan_va_server.py` | 18 | 仅导入方式 + `disable_mcp=True` + typo 修复，**推理逻辑相同** |
+| `wan_va/modules/model.py` | 297 | **几乎全部是 MCP 新增**，主干架构相同 |
+| `wan_va/train.py` | 321 | MCP 训练 + 索引缓存协调 + CLI 覆盖 |
+| `wan_va/dataset/lerobot_latent_dataset.py` | 229 | 几乎全部是索引缓存系统 |
+| `requirements.txt` | 0 | 相同 |
+
+**定位差异**：LingBot-VA 是通用 VA 基础模型工具箱（RoboTwin + LIBERO + Franka 真机，附 VA/VA2 两篇论文）；Next Forcing 收窄到 **RoboTwin 单基准 + MCP 训练目标**，换取 SOTA 精度和更强的复现工程。
+
+### 10.2 Next Forcing 新增的 feature
+
+| # | Feature | 代码位置 | 说明 |
+| --- | --- | --- | --- |
+| 1 | **MCP 多块预测训练目标**（核心） | `mcp.py`(新)、`model.py`(+297)、`train.py`(+321)、`fsdp.py`(+14)、`configs/mcp_train_config.py`(新) | next¹/²/³ 链式预测、多层融合 [3,11,19,29]、独立调度器 s_mcp=10、损失加权 [0.5,0.2,0.1]、MCP block 也做 FSDP 分片 + 激活检查点、逐深度 WandB 日志 |
+| 2 | **零开销推理开关** | `modules/utils.py` `load_transformer(disable_mcp=...)`、`model.py` `disable_mcp_modules` | 同一检查点训练带 MCP / 推理删 MCP；也能借此加载无 MCP 的旧检查点（架构兼容） |
+| 3 | **数据集索引缓存系统** | `dataset/lerobot_latent_dataset.py`(+229)、`build_dataset_index.py`(新)、`shared_config.py` 开关 | 指纹校验的 valid_metas JSON 缓存 + HF Arrow 文件直载 + 原子写入；多卡时 rank0 建缓存其余 barrier 等待；lingbot 每次全量扫描且 `Pool(128)` 硬编码 |
+| 4 | **LeRobot latent 数据视图工具** | `script/create_lerobot_latent_view.py`(新, 411 行) | symlink 组装分离存储的 latent 成标准 LeRobot 数据集，自动重写 episodes.jsonl 的 action_config；lingbot 无对应工具 |
+| 5 | **单元测试** | `tests/` ×3(新) | MCP 平移/校验、索引缓存、数据视图；**lingbot-va 完全没有测试** |
+| 6 | **完整 CLI 覆盖 + 环境变量配置** | `train.py` argparse（12 个新参数）、`NEXT_FORCING_*` / `ROBOTWIN_ROOT` 环境变量 | lingbot 训练只有 `--save-root`，路径全部硬编码 `/path/to/...`，wandb key 直接写在启动脚本里 |
+| 7 | **正规 Python 打包** | 相对导入（去掉 `sys.path.append` hack）、`pyproject.toml` `packages.find`、`-m wan_va.xxx` 启动 | lingbot 用文件路径启动 + 运行时改 sys.path |
+| 8 | **工程清理** | typo 修复：`eval_polict→eval_policy`、`i2av→i2va`、`sever_utils→server_utils`；`infer_mode` 收敛到 shared_config；black 替代 yapf；依赖精确 pin（`torch==2.9.0`）+ `train` extras | 提高可维护性与可复现性 |
+| 9 | **项目主页** | `docs/`(新, GitHub Pages) | 方法图、收敛曲线、对比视频；lingbot 只有 assets/teaser |
+| 10 | **训练默认值调整** | `va_robotwin_train_cfg.py` | lr 1e-5→**2e-5**、warmup 10→**100**、wandb 默认开→**关**、init_worker 默认 1 |
+
+### 10.3 LingBot-VA 有、Next Forcing 移除的 feature
+
+| # | Feature | 位置（lingbot-va） | 影响 |
+| --- | --- | --- | --- |
+| 1 | **LIBERO 基准全套支持** | `evaluation/libero/`（client 224 行 + 启动脚本）、`va_libero_{cfg,i2va,train_cfg}.py`、`example/libero/`、配置注册 `libero*` | next-forcing **不能直接跑 LIBERO**；需要时得从上游回移 |
+| 2 | **额外部署工具** | `Simple_Remote_Infer/deploy/{qwenpi_policy, replay_policy, image_tools, websocket_client_policy}.py` + README | OpenVLA 风格策略评测、回放策略、图像传输压缩工具不再随包提供 |
+| 3 | **更详尽的 README**（26KB vs 13KB） | 自定义数据集准备指南、attn_mode 配置说明、真机部署结果、ModelScope 下载链接、News 时间线 | 自定义数据接入文档变薄（部分由本报告 §6 弥补） |
+| 4 | **两篇 LingBot 论文 PDF + teaser 素材** | `LingBot_VA_paper.pdf`、`LingBot_VA2_paper.pdf`、`assets/` | 仅资料层面 |
+
+### 10.4 性能对比（Next Forcing 论文口径）
+
+| 维度 | LingBot-VA | Next Forcing |
+| --- | --- | --- |
+| RoboTwin 50 任务 (Clean/Random) | 92.9 / 91.5 | **94.1 / 93.5** |
+| 50fps 收敛速度 | 45k 步 | **20k 步（2.3×）** |
+| Clean 子集 20k 步消融 | 75.6% | **85.8%（+10.2）** |
+| 推理成本（当前发布代码） | 基准 | 与基准相同（零开销模式） |
+| 推理成本（MCP 2× 模式） | — | 论文报告 2×，**代码未发布** |
+| 训练成本 | 基准 | 更高（MCP 额外前向/反向 + 1.6B 额外参数，论文自述局限） |
+
+### 10.5 选型建议
+
+- **跑 LIBERO、真机 Franka 部署、需要 replay/qwenpi 工具** → 用 `lingbot-va`；
+- **追求 RoboTwin SOTA 精度、高帧率场景、更快收敛、更好的复现工程（测试/缓存/CLI/环境变量）** → 用 `next-forcing`；
+- **自定义数据后训练**：两者数据格式相同（LeRobot + 预计算 latent），next-forcing 额外提供 `create_lerobot_latent_view.py` 组装工具和索引缓存，大规模/网络存储下体验明显更好；但自定义数据集的文档要参考 lingbot-va README；
+- **检查点**：架构兼容（同为 30 层 Wan2.2 主干、diffusers 布局）。next-forcing 的推理代码通过 `disable_mcp` 也能加载无 MCP 的主干检查点（如 `next-forcing-base`）；反向用 lingbot-va 代码加载 next-forcing posttrain 检查点时，diffusers 会丢弃其不认识的 `enable_mcp` 配置项、MCP 权重成为 unexpected keys（理论上退化为零开销模式，未经上游验证）。
